@@ -53,7 +53,7 @@ public class ReactVlcPlayerViewManager extends SimpleViewManager<ReactVlcPlayerV
 
     @Override
     public void onDropViewInstance(ReactVlcPlayerView view) {
-        view.cleanUpResources();
+        view.dispose();
     }
 
     @Override

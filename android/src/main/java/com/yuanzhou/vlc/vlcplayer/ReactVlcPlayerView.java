@@ -65,6 +65,7 @@ class ReactVlcPlayerView extends TextureView implements
 
     private boolean isPaused = true;
     private boolean isHostPaused = false;
+    private boolean isLifecycleListenerRegistered = false;
     private int preVolume = 100;
     private boolean autoAspectRatio = false;
     private boolean acceptInvalidCertificates = false;
@@ -91,7 +92,25 @@ class ReactVlcPlayerView extends TextureView implements
         this.setSurfaceTextureListener(this);
 
         this.addOnLayoutChangeListener(onLayoutChangeListener);
-        context.addLifecycleEventListener(this);
+        registerLifecycleListenerIfNeeded();
+    }
+
+    private void registerLifecycleListenerIfNeeded() {
+        if (!isLifecycleListenerRegistered) {
+            themedReactContext.addLifecycleEventListener(this);
+            isLifecycleListenerRegistered = true;
+        }
+    }
+
+    private void unregisterLifecycleListenerIfNeeded() {
+        if (isLifecycleListenerRegistered) {
+            themedReactContext.removeLifecycleEventListener(this);
+            isLifecycleListenerRegistered = false;
+        }
+    }
+
+    private boolean hasActivePlayer() {
+        return mMediaPlayer != null && libvlc != null;
     }
 
 
@@ -104,12 +123,14 @@ class ReactVlcPlayerView extends TextureView implements
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        registerLifecycleListenerIfNeeded();
         //createPlayer();
     }
 
     @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
+        unregisterLifecycleListenerIfNeeded();
         stopPlayback();
     }
 
@@ -117,15 +138,21 @@ class ReactVlcPlayerView extends TextureView implements
 
     @Override
     public void onHostResume() {
-        if (mMediaPlayer != null && isSurfaceViewDestory && isHostPaused) {
-            IVLCVout vlcOut = mMediaPlayer.getVLCVout();
-            if (!vlcOut.areViewsAttached()) {
-                // vlcOut.setVideoSurface(this.getHolder().getSurface(), this.getHolder());
-                vlcOut.attachViews(onNewVideoLayoutListener);
-                isSurfaceViewDestory = false;
-                isPaused = false;
-                // this.getHolder().setKeepScreenOn(true);
-                mMediaPlayer.play();
+        if (hasActivePlayer() && isSurfaceViewDestory && isHostPaused) {
+            try {
+                IVLCVout vlcOut = mMediaPlayer.getVLCVout();
+                if (!vlcOut.areViewsAttached()) {
+                    // vlcOut.setVideoSurface(this.getHolder().getSurface(), this.getHolder());
+                    vlcOut.attachViews(onNewVideoLayoutListener);
+                    isSurfaceViewDestory = false;
+                    isPaused = false;
+                    // this.getHolder().setKeepScreenOn(true);
+                    mMediaPlayer.play();
+                }
+                isHostPaused = false;
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Skipping onHostResume playback because MediaPlayer was already released", e);
+                isPaused = true;
             }
         }
     }
@@ -133,14 +160,19 @@ class ReactVlcPlayerView extends TextureView implements
 
     @Override
     public void onHostPause() {
-        if (!isPaused && mMediaPlayer != null) {
-            isPaused = true;
-            isHostPaused = true;
-            mMediaPlayer.pause();
-            // this.getHolder().setKeepScreenOn(false);
-            WritableMap map = Arguments.createMap();
-            map.putString("type", "Paused");
-            eventEmitter.onVideoStateChange(map);
+        isHostPaused = true;
+        if (!isPaused && hasActivePlayer()) {
+            try {
+                isPaused = true;
+                mMediaPlayer.pause();
+                // this.getHolder().setKeepScreenOn(false);
+                WritableMap map = Arguments.createMap();
+                map.putString("type", "Paused");
+                eventEmitter.onVideoStateChange(map);
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Skipping onHostPause pause because MediaPlayer was already released", e);
+                isPaused = true;
+            }
         }
         Log.i("onHostPause", "---------onHostPause------------>");
     }
@@ -488,20 +520,54 @@ class ReactVlcPlayerView extends TextureView implements
     }
 
     private void releasePlayer() {
-        if (libvlc == null)
-            return;
-
-        final IVLCVout vout = mMediaPlayer.getVLCVout();
-        vout.removeCallback(callback);
-        vout.detachViews();
-        //surfaceView.removeOnLayoutChangeListener(onLayoutChangeListener);
-        mMediaPlayer.release();
-        libvlc.release();
-        libvlc = null;
-
-        if(mProgressUpdateRunnable != null){
+        if (mProgressUpdateRunnable != null) {
             mProgressUpdateHandler.removeCallbacks(mProgressUpdateRunnable);
+            mProgressUpdateRunnable = null;
         }
+
+        if (mMediaPlayer != null) {
+            try {
+                final IVLCVout vout = mMediaPlayer.getVLCVout();
+                vout.removeCallback(callback);
+                vout.detachViews();
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Ignoring MediaPlayer view detach failure during release", e);
+            }
+
+            try {
+                mMediaPlayer.setEventListener(null);
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Ignoring MediaPlayer listener cleanup failure during release", e);
+            }
+
+            try {
+                mMediaPlayer.release();
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Ignoring MediaPlayer release failure", e);
+            }
+
+            mMediaPlayer = null;
+        }
+
+        if (libvlc != null) {
+            try {
+                Dialog.setCallbacks(libvlc, null);
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Ignoring LibVLC callback cleanup failure during release", e);
+            }
+
+            try {
+                libvlc.release();
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Ignoring LibVLC release failure", e);
+            }
+
+            libvlc = null;
+        }
+
+        isPaused = true;
+        isHostPaused = false;
+        isSurfaceViewDestory = true;
     }
 
     /**
@@ -593,14 +659,19 @@ class ReactVlcPlayerView extends TextureView implements
      */
     public void setPausedModifier(boolean paused) {
         Log.i("paused:", "" + paused + ":" + mMediaPlayer);
-        if (mMediaPlayer != null) {
-            if (paused) {
+        if (hasActivePlayer()) {
+            try {
+                if (paused) {
+                    isPaused = true;
+                    mMediaPlayer.pause();
+                } else {
+                    isPaused = false;
+                    mMediaPlayer.play();
+                    Log.i("do play:", true + "");
+                }
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Skipping pause/play because MediaPlayer was already released", e);
                 isPaused = true;
-                mMediaPlayer.pause();
-            } else {
-                isPaused = false;
-                mMediaPlayer.play();
-                Log.i("do play:", true + "");
             }
         } else {
             createPlayer(!paused, false);
@@ -756,6 +827,11 @@ class ReactVlcPlayerView extends TextureView implements
             surfaceView.removeOnLayoutChangeListener(onLayoutChangeListener);
         }
         stopPlayback();
+    }
+
+    public void dispose() {
+        unregisterLifecycleListenerIfNeeded();
+        cleanUpResources();
     }
 
     @Override
